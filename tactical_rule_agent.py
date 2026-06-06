@@ -127,21 +127,92 @@ class TacticalRuleAgent:
         return tiles
 
     def _danger_tiles(self, grid, bombs, players, default_radius=2):
-        danger_soon = set()
-        danger_now = set()
+        bomb_info = []
+
         for b in bombs:
-            bx, by, timer = int(b[0]), int(b[1]), int(b[2])
+    
+            bx = int(b[0])
+            by = int(b[1])
+            timer = int(b[2])
+    
             owner_id = int(b[3]) if len(b) > 3 else -1
-            if timer <= 0:
-                continue
+    
             radius = default_radius
+    
             if 0 <= owner_id < len(players):
-                radius = max(1, int(players[owner_id][4]) + 1)
-            blast = self._blast_tiles(grid, bx, by, radius)
-            danger_soon |= blast
-            if timer <= 1:
+                radius = max(
+                    1,
+                    int(players[owner_id][4]) + 1
+                )
+    
+            bomb_info.append({
+                "pos": (bx, by),
+                "timer": timer,
+                "radius": radius
+            })
+    
+        # --------------------------------------------------
+        # Chain reaction propagation
+        # --------------------------------------------------
+    
+        changed = True
+    
+        while changed:
+    
+            changed = False
+    
+            for i, bomb_a in enumerate(bomb_info):
+    
+                blast_a = self._blast_tiles(
+                    grid,
+                    bomb_a["pos"][0],
+                    bomb_a["pos"][1],
+                    bomb_a["radius"]
+                )
+    
+                for j, bomb_b in enumerate(bomb_info):
+    
+                    if i == j:
+                        continue
+    
+                    if bomb_b["pos"] in blast_a:
+    
+                        if bomb_b["timer"] > bomb_a["timer"]:
+    
+                            bomb_b["timer"] = bomb_a["timer"]
+    
+                            changed = True
+    
+        # --------------------------------------------------
+        # Build danger map
+        # --------------------------------------------------
+    
+        danger_time = {}
+        danger_now = set()
+    
+        for bomb in bomb_info:
+    
+            blast = self._blast_tiles(
+                grid,
+                bomb["pos"][0],
+                bomb["pos"][1],
+                bomb["radius"]
+            )
+    
+            for tile in blast:
+    
+                if tile not in danger_time:
+                    danger_time[tile] = bomb["timer"]
+                else:
+                    danger_time[tile] = min(
+                        danger_time[tile],
+                        bomb["timer"]
+                    )
+    
+            if bomb["timer"] <= 1:
                 danger_now |= blast
-        return danger_soon, danger_now
+    
+        return danger_time, danger_now
 
     def _open_neighbors(self, grid, pos, occupied):
         cnt = 0
