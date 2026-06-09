@@ -231,10 +231,11 @@ class TacticalRuleAgent:
             (x, y)
             for x in range(grid.shape[0])
             for y in range(grid.shape[1])
-            if self._passable(grid, x, y) and (x, y) not in danger_soon
+            if self._passable(grid, x, y) 
+            and danger_time.get((x, y), 999) > 2
         }
 
-    def _best_escape_action(self, grid, my_pos, occupied, danger_now, danger_soon):
+    def _best_escape_action(self, grid, my_pos, occupied, danger_now, danger_time):
         best_action = None
         best_score = -10**9
         for a in self._valid_actions(grid, my_pos, occupied):
@@ -245,12 +246,15 @@ class TacticalRuleAgent:
             if npos in danger_now:
                 continue
             score = 0
-            if npos not in danger_soon:
-                score += 6
+
+            explore_turn = danger_time.get(npos, 999)
+            score += min(explode_turn, 10)
             score += self._open_neighbors(grid, npos, occupied)
+
             if score > best_score:
                 best_score = score
                 best_action = a
+                
         return best_action
 
     def _move_to_targets(self, grid, start, targets, occupied, danger_soon):
