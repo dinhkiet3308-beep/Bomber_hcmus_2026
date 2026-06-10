@@ -43,14 +43,14 @@ class TacticalRuleAgent:
         blocked = set(occupied) | bomb_positions
         blocked.discard(my_pos)
 
-        danger_soon, danger_now = self._danger_tiles(grid, bombs, players, default_radius=2)
+        danger_time, danger_now = self._danger_tiles(grid, bombs, players, default_radius=2)
         valid_actions = self._valid_actions(grid, my_pos, blocked)
 
-        if my_pos in danger_now or my_pos in danger_soon:
-            escape = self._best_escape_action(grid, my_pos, blocked, danger_now, danger_soon)
+        if my_pos in danger_now or danger_time.get(my_pos, 999) <= 2:
+            escape = self._best_escape_action(grid, my_pos, blocked, danger_now, danger_time)
             if escape is None:
                 escape = self._move_to_targets(
-                    grid, my_pos, self._safe_tiles(grid, danger_soon), blocked, danger_soon
+                    grid, my_pos, self._safe_tiles(grid, danger_time), blocked, danger_time
                 )
             if escape is None:
                 loose = [
@@ -67,7 +67,7 @@ class TacticalRuleAgent:
             prefer_radius=int(bomb_bonus) <= 1,
         )
         if item_tiles:
-            move = self._move_to_targets(grid, my_pos, item_tiles, blocked, danger_soon)
+            move = self._move_to_targets(grid, my_pos, item_tiles, blocked, danger_time)
             if move is not None:
                 return move
 
@@ -75,22 +75,28 @@ class TacticalRuleAgent:
             can_hit_enemy = self._can_bomb_hit_enemy(grid, my_pos, enemies, bomb_radius)
             boxes_hit = self._count_boxes_in_blast(grid, my_pos, bomb_radius)
             if (can_hit_enemy or boxes_hit >= 1) and self._can_escape_after_placing(
-                grid, my_pos, blocked, danger_soon, bomb_radius # danger soon
+                grid, my_pos, blocked, danger_time, bomb_radius # danger time
             ):
                 return 5
 
         box_spots = self._box_bomb_spots(grid, blocked)
         if box_spots:
-            move = self._move_to_targets(grid, my_pos, box_spots, blocked, danger_soon)
+            move = self._move_to_targets(grid, my_pos, box_spots, blocked, danger_time)
             if move is not None:
                 return move
 
         if enemies:
-            move = self._move_to_targets(grid, my_pos, set(enemies), blocked, danger_soon)
+            move = self._move_to_targets(grid, my_pos, set(enemies), blocked, danger_time)
             if move is not None:
                 return move
 
-        safe_moves = [a for a in valid_actions if self._next_pos(my_pos, a) not in danger_soon]
+        safe_moves = []
+        
+        for a in valid_actions:
+            npos = self._next_pos(my_pos, a)
+            if danger_time.get(npos, 999) > 2:
+                safe_moves.append(a)
+                
         return random.choice(safe_moves) if safe_moves else 0
 
     def _next_pos(self, pos, action):
@@ -214,6 +220,10 @@ class TacticalRuleAgent:
     
         return danger_time, danger_now
 
+    def _is_tile_reachable_before_explosion(self, pos, steps_taken, danger_time):
+        explode_turn = danger_time.get(pos, 999)
+        return steps_taken < explode_turn
+        
     def _open_neighbors(self, grid, pos, occupied):
         cnt = 0
         for a in [1, 2, 3, 4]:
@@ -222,7 +232,7 @@ class TacticalRuleAgent:
                 cnt += 1
         return cnt
 
-    def _safe_tiles(self, grid, danger_soon):
+    def _safe_tiles(self, grid, danger_time):
         """
         Return all tiles that are safe to move to.
         A tile is safe to move to if it is not in danger_soon.
@@ -247,7 +257,7 @@ class TacticalRuleAgent:
                 continue
             score = 0
 
-            explore_turn = danger_time.get(npos, 999)
+            explode_turn = danger_time.get(npos, 999)
             score += min(explode_turn, 10)
             score += self._open_neighbors(grid, npos, occupied)
 
@@ -257,28 +267,39 @@ class TacticalRuleAgent:
                 
         return best_action
 
-    def _move_to_targets(self, grid, start, targets, occupied, danger_soon):
+    def _move_to_targets(self, grid, start, targets, occupied, danger_time):
         if not targets:
             return None
-        q = deque([(start, None)])
+            
+        q = deque([(start, None, 0)])
         seen = {start}
+        
         while q:
-            pos, first_action = q.popleft()
+            pos, first_action, dist = q.popleft()
             if pos in targets and first_action is not None:
                 return first_action
             for a in [1, 2, 3, 4]:
                 nx, ny = self._next_pos(pos, a)
                 npos = (nx, ny)
+                
                 if npos in seen:
                     continue
+                    
                 if not self._passable(grid, nx, ny):
                     continue
+
                 if npos in occupied and npos not in targets:
                     continue
-                if npos in danger_soon:
+                    
+                next_dist = dist + 1
+                
+                if not self._is_tile_reachable_before_explosion(npos, next_dist, danger_time):
                     continue
+                
                 seen.add(npos)
-                q.append((npos, a if first_action is None else first_action))
+                
+                q.append((npos, a if first_action is None else first_action, next_dist))
+                
         return None
 
     def _line_clear(self, grid, a, b):
@@ -325,10 +346,53 @@ class TacticalRuleAgent:
                 q.append((npos, d + 1, a if first_action is None else first_action))
         return None
 
-    def _can_escape_after_placing(self, grid, my_pos, occupied, danger_soon, bomb_radius):
-        my_blast = self._blast_tiles(grid, my_pos[0], my_pos[1], bomb_radius)
-        combined = set(danger_soon) | my_blast
-        return self._move_to_nearest_safe(grid, my_pos, occupied, combined) is not None
+    def _can_escape_after_placing(self, grid, my_pos, occupied, danger_time, bomb_radius):
+        simulated_danger = dict(danger_time)
+
+        my_blast = self._blast_tiles(
+            grid,
+            my_pos[0],
+            my_pos[1],
+            bomb_radius
+        )
+    
+        for tile in my_blast:
+            simulated_danger[tile] = min(
+                simulated_danger.get(tile, 999),
+                7
+            )
+    
+        q = deque([(my_pos, 0)])
+        seen = {my_pos}
+    
+        while q:
+            pos, dist = q.popleft()
+    
+            if pos not in my_blast:
+                return True
+    
+            for a in [1, 2, 3, 4]:
+                nx, ny = self._next_pos(pos, a)
+                npos = (nx, ny)
+    
+                if npos in seen:
+                    continue
+    
+                if not self._passable(grid, nx, ny):
+                    continue
+    
+                if npos in occupied:
+                    continue
+    
+                next_dist = dist + 1
+    
+                if next_dist >= simulated_danger.get(npos, 999):
+                    continue
+    
+                seen.add(npos)
+                q.append((npos, next_dist))
+    
+        return False
 
     def _count_boxes_in_blast(self, grid, my_pos, radius):
         return sum(1 for x, y in self._blast_tiles(grid, my_pos[0], my_pos[1], radius) if grid[x, y] == 2)
