@@ -85,10 +85,26 @@ class TacticalRuleAgent:
             if move is not None:
                 return move
 
-        if enemies:
-            move = self._move_to_targets(grid, my_pos, set(enemies), blocked, danger_time)
-            if move is not None:
-                return move
+        move = None
+        
+        attack_spots = self._attack_positions(
+            grid,
+            enemies,
+            blocked,
+            bomb_radius
+        )
+
+        if attack_spots:
+            move = self._move_to_targets(
+                grid,
+                my_pos,
+                attack_spots,
+                blocked,
+                danger_time
+            )
+
+        if move is not None:
+            return move
 
         safe_moves = []
         
@@ -222,7 +238,7 @@ class TacticalRuleAgent:
 
     def _is_tile_reachable_before_explosion(self, pos, steps_taken, danger_time):
         explode_turn = danger_time.get(pos, 999)
-        return steps_taken < explode_turn
+        return steps_taken <= explode_turn
         
     def _open_neighbors(self, grid, pos, occupied):
         cnt = 0
@@ -328,6 +344,38 @@ class TacticalRuleAgent:
                 return True
         return False
 
+    def _attack_positions(self, grid, enemies, occupied, radius):
+        spots = set()
+    
+        for ex, ey in enemies:
+    
+            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+    
+                for r in range(1, radius + 1):
+    
+                    x = ex + dx * r
+                    y = ey + dy * r
+    
+                    if not self._in_bounds(grid, x, y):
+                        break
+    
+                    if not self._passable(grid, x, y):
+                        break
+    
+                    if (x, y) in occupied:
+                        continue
+    
+                    if self._can_bomb_hit_enemy(
+                        grid,
+                        (x, y),
+                        [(ex, ey)],
+                        radius
+                    ):
+                        if self._open_neighbors(grid, (x, y), occupied) >= 2:
+                            spots.add((x, y))
+    
+        return spots
+    
     def _move_to_nearest_safe(self, grid, start, occupied, danger, search_depth=8):
         q = deque([(start, 0, None)])
         seen = {start}
