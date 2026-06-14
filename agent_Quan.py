@@ -128,11 +128,15 @@ class TacticalRuleAgent:
         # ============================================================
         # PRIORITY 5: STAT BOMB (tiebreaker padding)
         # ============================================================
-        if phase == "late" and self.step_count >= 450: 
+        is_board_empty = not box_spots  # True if all boxes are destroyed
+        
+        if (self.step_count >= 250 or is_board_empty): 
             if bombs_left > 0 and my_pos not in bomb_positions:
-                if self._can_escape_after_placing(grid, my_pos, blocked, danger_times, bomb_radius, enemy_set, obs):
+                if self._can_escape_after_placing(grid, my_pos, blocked, danger_times, bomb_radius, enemy_set):
                     my_exits = self._open_neighbors(grid, my_pos, blocked)
-                    if my_exits >= 2:  
+                    # We require >= 3 exits here so we only stat-bomb in wide open areas,
+                    # ensuring we never accidentally trap ourselves in a corridor just for a point.
+                    if my_exits >= 3:  
                         return 5
 
         # ============================================================
