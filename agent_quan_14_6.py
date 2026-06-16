@@ -1,7 +1,8 @@
 import random
 from collections import deque
 import heapq
-
+import numpy as np
+from data_harvester import DataHarvester
 
 class TacticalRuleAgent:
     """
@@ -28,12 +29,74 @@ class TacticalRuleAgent:
     def __init__(self, agent_id: int):
         self.agent_id = int(agent_id)
         self.step_count = 0
+        self.harvester = DataHarvester(save_dir="expert_data")
+        self._match_saved = False  # Guard against duplicate save_match calls
+        self._kills = 0            # Track kills for enriched outcome
+        self._boxes_destroyed = 0  # Track boxes destroyed for enriched outcome
+        self._prev_alive_enemies = None
+        self._prev_boxes = None
 
     # ==================================================================
     # MAIN DECISION LOOP
     # ==================================================================
 
     def act(self, obs):
+        """The Wrapper Method: Intercepts the heuristic choice and logs it."""
+
+        if self._match_saved:
+            return 0
+        
+        # 1. Ask the heuristic engine to calculate the best move
+        chosen_action = self._decide_action(obs)
+        
+        # 2. Re-calculate the danger map for the neural network tensor
+        grid = obs["map"]
+        players = obs["players"]
+        bombs = obs["bombs"]
+        danger_times = self._build_danger_map(grid, bombs, players)
+        
+        # 3. Build the 9-channel state tensor
+        state_tensor = self._tensorize_state(obs, danger_times)
+        
+        # 4. Track kills and boxes destroyed (for enriched outcome signal)
+        alive_enemies = sum(1 for i, p in enumerate(players) if i != self.agent_id and p[2] == 1)
+        current_boxes = int(np.sum(grid == 2))
+        
+        if self._prev_alive_enemies is not None:
+            killed_this_step = self._prev_alive_enemies - alive_enemies
+            if killed_this_step > 0:
+                self._kills += killed_this_step
+        if self._prev_boxes is not None:
+            destroyed_this_step = self._prev_boxes - current_boxes
+            if destroyed_this_step > 0:
+                self._boxes_destroyed += destroyed_this_step
+        
+        self._prev_alive_enemies = alive_enemies
+        self._prev_boxes = current_boxes
+        
+        # 5. Record the frame into your harvester
+        self.harvester.record_step(state_tensor, chosen_action)
+        
+        # 6. Detect if the game is ending to trigger a save (with guard)
+        my_status = players[self.agent_id][2]
+        is_match_over = (my_status == 0 or alive_enemies == 0 or self.step_count >= 500)
+        
+        if is_match_over and not self._match_saved:
+            self._match_saved = True
+            # A win requires us alive AND all enemies dead (not mutual annihilation)
+            match_won = (my_status == 1 and alive_enemies == 0)
+            survival_ratio = min(self.step_count / 500.0, 1.0)
+            self.harvester.save_match(
+                match_won=match_won,
+                survival_ratio=survival_ratio,
+                kills=self._kills,
+                boxes_destroyed=self._boxes_destroyed,
+            )
+        
+        # 7. Execute the move in the actual game
+        return chosen_action
+
+    def _decide_action(self, obs):
         grid = obs["map"]
         players = obs["players"]
         bombs = obs["bombs"]
@@ -723,3 +786,137 @@ class TacticalRuleAgent:
                 best_action = a
 
         return best_action if best_action is not None else random.choice(safe_actions)
+
+    def _tensorize_state(self, obs, danger_times):
+        """Converts the raw observation into a 9x13x13 spatial tensor.
+        
+        Channels:
+            0: Walls (binary)
+            1: Boxes (binary)
+            2: Items (radius=0.5, capacity=1.0)
+            3: My position (binary)
+            4: Enemy positions (binary)
+            5: Bomb timers (normalized 0-1)
+            6: Danger map (inverted urgency, higher = more imminent)
+            7: My bombs remaining (constant fill, normalized by 5)
+            8: My bomb radius (constant fill, normalized by 5)
+        """
+        grid = obs["map"]
+        players = obs["players"]
+        bombs = obs["bombs"]
+        
+        # Initialize an empty tensor with shape (Channels, Width, Height)
+        state_tensor = np.zeros((9, 13, 13), dtype=np.float32)
+        
+        # Channel 0: Walls
+        state_tensor[0] = (grid == 1).astype(np.float32)
+        
+        # Channel 1: Boxes
+        state_tensor[1] = (grid == 2).astype(np.float32)
+        
+        # Channel 2: Items (Radius = 0.5, Capacity = 1.0 to differentiate)
+        state_tensor[2][grid == 3] = 0.5
+        state_tensor[2][grid == 4] = 1.0
+        
+        # Channels 3 & 4: Player positions
+        my_x, my_y = int(players[self.agent_id][0]), int(players[self.agent_id][1])
+        state_tensor[3, my_x, my_y] = 1.0
+        
+        for i, p in enumerate(players):
+            if i != self.agent_id and p[2] == 1: # If enemy and alive
+                state_tensor[4, int(p[0]), int(p[1])] = 1.0
+                
+        # Channel 5: Bomb timers (Normalized: timer / 7.0)
+        for b in bombs:
+            bx, by, timer = int(b[0]), int(b[1]), int(b[2])
+            state_tensor[5, bx, by] = timer / 7.0
+            
+        # Channel 6: Agent Quan's Danger Map (Superhuman Foresight)
+        # We invert the timer so imminent danger (1) is a high signal (1.0) 
+        # and distant danger (7) is a low signal (~0.14)
+        for x in range(13):
+            for y in range(13):
+                earliest_danger = self._earliest_danger(danger_times, (x, y))
+                if earliest_danger <= 7:
+                    state_tensor[6, x, y] = (8 - earliest_danger) / 7.0
+        
+        # Channel 7: My bombs remaining (constant fill, normalized)
+        # Gives the neural net awareness of our offensive capacity
+        bombs_left = int(players[self.agent_id][3])
+        state_tensor[7, :, :] = bombs_left / 5.0
+        
+        # Channel 8: My bomb radius (constant fill, normalized)
+        # Gives the neural net awareness of our blast power
+        bomb_bonus = int(players[self.agent_id][4])
+        bomb_radius = max(1, bomb_bonus + 1)
+        state_tensor[8, :, :] = bomb_radius / 5.0
+                    
+        return state_tensor
+
+    def get_masked_action(self, neural_network_logits, grid, my_pos, blocked, danger_times):
+        """
+        neural_network_logits: A list or array of 6 numbers predicted by your model.
+        Returns: The safest action chosen by the network.
+        """
+        import math
+        
+        # 1. Ask Agent Quan what actions are physically possible
+        valid_actions = self._valid_actions(grid, my_pos, blocked)
+        
+        # 2. Ask Agent Quan if any of these moves lead to instant death next turn
+        safe_actions = [
+            a for a in valid_actions 
+            if not self._is_tile_dangerous_at(danger_times, self._next_pos(my_pos, a), 1)
+        ]
+        
+        # Fallback if no safe actions exist (we are trapped)
+        if not safe_actions:
+            safe_actions = valid_actions
+            
+        # 3. Mask the neural network's predictions
+        masked_logits = np.copy(neural_network_logits)
+        for action in range(6):
+            if action not in safe_actions:
+                # Set illegal actions to negative infinity so they have 0% chance of being picked
+                masked_logits[action] = -math.inf 
+                
+        # 4. Pick the action the Neural Network wants most, from the SAFE list
+        best_action = np.argmax(masked_logits)
+        return best_action
+
+    def calculate_step_reward(self, previous_obs, current_obs, action_taken):
+        reward = 0.0
+        
+        prev_me = previous_obs["players"][self.agent_id]
+        curr_me = current_obs["players"][self.agent_id]
+        
+        # 1. Terminal States (The Ultimate Goals)
+        if prev_me[2] == 1 and curr_me[2] == 0:
+            return -100.0  # Massive penalty for dying
+            
+        alive_enemies_prev = sum(1 for i, p in enumerate(previous_obs["players"]) if i != self.agent_id and p[2] == 1)
+        alive_enemies_curr = sum(1 for i, p in enumerate(current_obs["players"]) if i != self.agent_id and p[2] == 1)
+        
+        if alive_enemies_curr == 0 and curr_me[2] == 1:
+            return 100.0   # Massive reward for winning the match
+            
+        # 2. The Kill Reward (Tie-breaker #1)
+        if alive_enemies_curr < alive_enemies_prev:
+            reward += 50.0  # Strongly encourage aggressive trapping
+            
+        # 3. Box Farming (Tie-breaker #2)
+        boxes_prev = np.sum(previous_obs["map"] == 2)
+        boxes_curr = np.sum(current_obs["map"] == 2)
+        if boxes_curr < boxes_prev:
+            # Reward proportional to how many boxes were destroyed this exact step
+            reward += 5.0 * (boxes_prev - boxes_curr) 
+            
+        # 4. Item Collection (Tie-breaker #3)
+        if curr_me[3] > prev_me[3] or curr_me[4] > prev_me[4]:
+            reward += 2.0
+            
+        # 5. Bomb Placement (Tie-breaker #4)
+        if action_taken == 5:
+            reward += 0.1  # Very small positive integer. Encourages placing safe bombs when bored.
+            
+        return reward
