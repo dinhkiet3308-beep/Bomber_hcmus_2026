@@ -885,38 +885,87 @@ class TacticalRuleAgent:
         return best_action
 
     def calculate_step_reward(self, previous_obs, current_obs, action_taken):
+        """Compute a shaped reward signal for RL training.
+        
+        REBALANCED: Aggression-first rewards.
+        Old problem: Death=-100 >> Kill=+50 taught "run away and hide."
+        New balance: Kill=+100, Death=-50, Win=+200.
+        This teaches "killing is worth risking death."
+        """
         reward = 0.0
         
         prev_me = previous_obs["players"][self.agent_id]
         curr_me = current_obs["players"][self.agent_id]
         
-        # 1. Terminal States (The Ultimate Goals)
+        # 0. Time penalty — discourages passive stalling
+        reward -= 0.05
+        
+        # 1. Terminal: Death penalty (HALVED from -100 to -50)
         if prev_me[2] == 1 and curr_me[2] == 0:
-            return -100.0  # Massive penalty for dying
+            return -50.0
             
         alive_enemies_prev = sum(1 for i, p in enumerate(previous_obs["players"]) if i != self.agent_id and p[2] == 1)
         alive_enemies_curr = sum(1 for i, p in enumerate(current_obs["players"]) if i != self.agent_id and p[2] == 1)
         
+        # 2. Terminal: Win bonus (DOUBLED from +100 to +200)
         if alive_enemies_curr == 0 and curr_me[2] == 1:
-            return 100.0   # Massive reward for winning the match
+            return 200.0
             
-        # 2. The Kill Reward (Tie-breaker #1)
-        if alive_enemies_curr < alive_enemies_prev:
-            reward += 50.0  # Strongly encourage aggressive trapping
+        # 3. Kill reward — DOUBLED from +50 to +100
+        enemies_killed = alive_enemies_prev - alive_enemies_curr
+        if enemies_killed > 0:
+            reward += 100.0 * enemies_killed
             
-        # 3. Box Farming (Tie-breaker #2)
+        # 4. Survival bonus — reward for still being alive while enemies die
+        if enemies_killed > 0 and curr_me[2] == 1:
+            reward += 10.0
+            
+        # 5. Box farming — proportional to boxes destroyed
         boxes_prev = np.sum(previous_obs["map"] == 2)
         boxes_curr = np.sum(current_obs["map"] == 2)
         if boxes_curr < boxes_prev:
-            # Reward proportional to how many boxes were destroyed this exact step
-            reward += 5.0 * (boxes_prev - boxes_curr) 
+            reward += 3.0 * (boxes_prev - boxes_curr) 
             
-        # 4. Item Collection (Tie-breaker #3)
+        # 6. Item collection — power-ups make us stronger
         if curr_me[3] > prev_me[3] or curr_me[4] > prev_me[4]:
-            reward += 2.0
+            reward += 3.0
             
-        # 5. Bomb Placement (Tie-breaker #4)
+        # 7. Bomb placement — context-aware: higher reward near enemies/boxes
         if action_taken == 5:
-            reward += 0.1  # Very small positive integer. Encourages placing safe bombs when bored.
+            my_pos = (int(curr_me[0]), int(curr_me[1]))
+            grid = current_obs["map"]
+            enemies = [
+                (int(p[0]), int(p[1]))
+                for i, p in enumerate(current_obs["players"])
+                if i != self.agent_id and p[2] == 1
+            ]
+            bomb_reward = 0.1
+            for ex, ey in enemies:
+                dist = abs(my_pos[0] - ex) + abs(my_pos[1] - ey)
+                if dist <= 3:
+                    bomb_reward += 8.0   # high reward for close-range bombs
+                elif dist <= 5:
+                    bomb_reward += 3.0
+            for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+                nx, ny = my_pos[0]+dx, my_pos[1]+dy
+                if 0 <= nx < grid.shape[0] and 0 <= ny < grid.shape[1] and grid[nx, ny] == 2:
+                    bomb_reward += 0.5
+            reward += bomb_reward
+        
+        # 8. NEW: Enemy proximity reward — encourages approaching enemies
+        #    (combat-ready positioning rather than hiding in corners)
+        my_pos = (int(curr_me[0]), int(curr_me[1]))
+        enemies_curr_positions = [
+            (int(p[0]), int(p[1]))
+            for i, p in enumerate(current_obs["players"])
+            if i != self.agent_id and p[2] == 1
+        ]
+        if enemies_curr_positions:
+            closest_dist = min(abs(my_pos[0]-ex) + abs(my_pos[1]-ey) for ex, ey in enemies_curr_positions)
+            # Reward for being within striking range (3-5 tiles), penalize camping far away
+            if closest_dist <= 5:
+                reward += 0.3  # in combat range — good
+            elif closest_dist >= 10:
+                reward -= 0.2  # camping too far — bad
             
         return reward
